@@ -96,7 +96,7 @@ def indicator_page(st, back_page) -> None:
                     st.error(str(error))
 
         with st.expander("Reservväg: läs in nedladdade källfiler"):
-            st.write("Om en källa inte går att hämta från servern kan du ladda ner den i webbläsaren och välja filen här. Inkomst kan läsas in separat. OSM-filerna behöver omfatta alla tre kommunernas sökrutor.")
+            st.write("Om en källa inte går att hämta från servern kan du ladda ner den i webbläsaren och välja filen här. Inkomst kan läsas in separat. OSM-filerna behöver omfatta alla tre kommunernas sökrutor. Både Overpass JSON och Overpass Turbo GeoJSON med punkter stöds.")
             st.markdown("[Ladda ner SCB:s originalfil TAB6684_sv.zip](https://www.statistikdatabasen.scb.se/Resources/PX/bulk/ssd/sv/TAB6684_sv.zip). Behåll ZIP-formatet; appen väljer rätt år, mått och områden.")
             for code, name in (("1280", "Malmö"), ("1283", "Helsingborg"), ("2180", "Gävle")):
                 url = "https://overpass-api.de/api/interpreter?" + urllib.parse.urlencode({"data": indicator_access_query(code)})
@@ -382,6 +382,7 @@ def indicator_parse_income_zip(raw, expected):
     if header_price_years and any(year != "2024" for year in header_price_years):
         raise ValueError("SCB-exportens prisår ska vara 2024.")
     selected, count = {}, 0
+    duplicate_resolution = {"repeatedRows": 0, "missingWithObserved": 0, "identicalObserved": 0, "repeatedMissing": 0}
     for row in reader:
         count += 1
         if str(row.get(years[0], "")).strip() != str(INDICATOR_YEAR):
@@ -395,8 +396,6 @@ def indicator_parse_income_zip(raw, expected):
         code = match[1] if match else None
         if code not in expected:
             continue
-        if code in selected:
-            raise ValueError("Dubbelt medianvärde för " + code)
         if None in row:
             raise ValueError("SCB-raden innehåller fler värden än CSV-rubriken: " + code)
         value = str(row.get(value_field, "")).strip()
@@ -407,14 +406,30 @@ def indicator_parse_income_zip(raw, expected):
                 number = float(value.replace("\xa0", "").replace(" ", "").replace(",", "."))
             except ValueError as error:
                 raise ValueError("Ogiltig inkomstcell för " + code) from error
-        selected[code] = number
+        if number is not None and not indicator_number(number, positive=True):
+            raise ValueError("Inkomst ska vara positiv eller saknad: " + code)
+        if code in selected:
+            duplicate_resolution["repeatedRows"] += 1
+            previous = selected[code]
+            if previous is None and number is None:
+                duplicate_resolution["repeatedMissing"] += 1
+            elif previous is None or number is None:
+                duplicate_resolution["missingWithObserved"] += 1
+                selected[code] = number if previous is None else previous
+            elif previous == number:
+                duplicate_resolution["identicalObserved"] += 1
+            else:
+                raise ValueError("Dubbelt medianvärde med olika observationer för " + code + ": " + str(previous) + " och " + str(number))
+        else:
+            selected[code] = number
     obj = {"schema": "vagvis-income-1", "dataYear": INDICATOR_YEAR, "desoVersion": "2025",
            "measure": "median_ekonomisk_standard", "unit": "tkr_2024_prices",
            "rows": [{"kod": code, "income": value} for code, value in sorted(selected.items())],
            "source": {"url": INDICATOR_SCB_URL, "table": "TAB6684", "zipSha256": indicator_digest(raw),
                       "zipBytes": len(raw), "csvSha256": indicator_digest(csv_raw), "member": member,
                       "encoding": encoding, "delimiter": delimiter, "parsedRows": count, "layout": layout,
-                      "filter": {"year": INDICATOR_YEAR, "content": "Medianvärde, tkr", "desoVersion": "2025"}}}
+                      "filter": {"year": INDICATOR_YEAR, "content": "Medianvärde, tkr", "desoVersion": "2025"},
+                      "duplicateResolution": {**duplicate_resolution, "rule": "For the same code/year/median, keep the sole observed value when other rows are missing; identical observations are collapsed. Different observed values fail explicitly. Missing values are never imputed."}}}
     indicator_validate_income(obj, expected)
     return obj
 
@@ -439,10 +454,45 @@ def indicator_parse_osm(raw, city):
         obj = indicator_json.loads(raw)
     except (ValueError, UnicodeError) as error:
         raise ValueError("OSM-exporten kunde inte läsas som JSON.") from error
-    if not isinstance(obj, dict) or obj.get("remark") or not isinstance(obj.get("elements"), list):
-        raise ValueError("OSM-exporten är ofullständig eller innehåller ett Overpass-fel.")
+    if not isinstance(obj, dict):
+        raise ValueError("OSM-exporten ska vara ett JSON-objekt.")
+    if obj.get("remark"):
+        raise ValueError("Overpass rapporterar ett fel: " + str(obj["remark"]))
+    if obj.get("type") == "FeatureCollection":
+        if not isinstance(obj.get("features"), list):
+            raise ValueError("GeoJSON-exporten saknar en lista med features.")
+        elements = []
+        for feature in obj["features"]:
+            if not isinstance(feature, dict) or feature.get("type") != "Feature" or not isinstance(feature.get("properties"), dict):
+                raise ValueError("GeoJSON-exporten innehåller ett ogiltigt objekt.")
+            tags = feature["properties"]
+            ident = feature.get("id", tags.get("@id"))
+            if tags.get("@id") is not None and tags["@id"] != ident:
+                raise ValueError("GeoJSON-objektets OSM-identiteter stämmer inte överens.")
+            match = indicator_re.fullmatch(r"(node|way|relation)/([1-9]\d*)", ident or "") if isinstance(ident, str) else None
+            if match is None:
+                raise ValueError("GeoJSON-objektet saknar en entydig OSM-identitet, till exempel node/123.")
+            geometry = feature.get("geometry")
+            if not isinstance(geometry, dict) or geometry.get("type") != "Point":
+                raise ValueError("GeoJSON-exporten ska innehålla punkter från out center. Polygoner räknas inte om till en egen påhittad mittpunkt.")
+            coordinates = geometry.get("coordinates")
+            if not isinstance(coordinates, list) or len(coordinates) < 2:
+                raise ValueError("GeoJSON-punkten saknar WGS84-koordinater.")
+            location = {"lon": coordinates[0], "lat": coordinates[1]}
+            element = {"type": match[1], "id": int(match[2]), "tags": {k: v for k, v in tags.items() if not k.startswith("@")}}
+            if match[1] == "node":
+                element.update(location)
+            else:
+                element["center"] = location
+            elements.append(element)
+        stamp = obj.get("timestamp")
+    elif isinstance(obj.get("elements"), list):
+        elements = obj["elements"]
+        stamp = obj.get("osm3s", {}).get("timestamp_osm_base") if isinstance(obj.get("osm3s", {}), dict) else None
+    else:
+        raise ValueError("OSM-exporten ska vara Overpass JSON med elements eller Overpass Turbo GeoJSON med FeatureCollection och punkter.")
     points, seen = [], set()
-    for element in obj["elements"]:
+    for element in elements:
         if not isinstance(element, dict) or not isinstance(element.get("tags", {}), dict):
             raise ValueError("Ogiltigt OSM-element.")
         tags = element.get("tags") or {}
@@ -466,10 +516,17 @@ def indicator_parse_osm(raw, city):
                        "tags": {key: tags[key] for key in ("shop", "railway", "amenity", "public_transport") if key in tags}})
     if any(not any(point["kind"] == kind for point in points) for kind in ("service", "transit")):
         raise ValueError("OSM-exporten saknar dagligvaror eller större kollektivtrafiknoder för " + city)
-    stamp = obj.get("osm3s", {}).get("timestamp_osm_base") if isinstance(obj.get("osm3s", {}), dict) else None
     if stamp is not None and not isinstance(stamp, str):
         raise ValueError("OSM-exportens källdatum är ogiltigt.")
     return points, stamp
+
+
+def indicator_osm_export_info(raw):
+    obj = indicator_json.loads(raw)
+    geojson = obj.get("type") == "FeatureCollection"
+    return {"format": "Overpass Turbo GeoJSON" if geojson else "Overpass JSON",
+            "timestampKind": "export_timestamp" if geojson else "osm_database_timestamp",
+            "generator": obj.get("generator"), "copyright": obj.get("copyright")}
 
 
 def indicator_validate_pois(obj):
@@ -542,6 +599,11 @@ def indicator_build(files, income=None, pois=None, receipt=None, raw_sources=Non
         source_years["income"] = INDICATOR_YEAR
     if pois is not None:
         source_years["pois"] = pois.get("osmTimestamp")
+        meta["poiTimestampKinds"] = sorted({s.get("timestampKind", "not_specified") for s in pois.get("sources", [])})
+        if "export_timestamp" in meta["poiTimestampKinds"]:
+            note = "GeoJSON-källans tidsstämpel är exportens tidsstämpel; den bevisar inte separat OSM-databasens datum eller att verksamheten fanns 2024."
+            if note not in meta.setdefault("caveats", []):
+                meta["caveats"].append(note)
     for source in meta.get("sources", []):
         if (source.get("id") == "SCB_TAB6684" and income is not None) or (source.get("id") == "OSM_ACCESS" and pois is not None):
             source["status"] = "cached_observations"
@@ -566,7 +628,7 @@ def indicator_osm_document(city_results):
            "osmTimestamp": sorted({item["osmTimestamp"] for item in city_results.values() if item.get("osmTimestamp")}),
            "searchBboxes": INDICATOR_BBOX,
            "points": [point for city in INDICATOR_CITIES for point in city_results[city]["points"]],
-           "sources": [{key: city_results[city].get(key) for key in ("city", "url", "query", "sha256", "osmTimestamp")}
+           "sources": [{key: city_results[city].get(key) for key in ("city", "url", "query", "queryTemplate", "queryVerified", "sha256", "osmTimestamp", "format", "timestampKind", "generator", "copyright")}
                        for city in INDICATOR_CITIES]}
     indicator_validate_pois(obj)
     return obj
@@ -593,8 +655,9 @@ def indicator_import(files, income_zip=None, osm_exports=None, origin="manual", 
         for city in INDICATOR_CITIES:
             raw = osm_exports[city]
             points, stamp = indicator_parse_osm(raw, city)
-            cities[city] = {"success": True, "city": city, "url": None, "query": indicator_access_query(city),
-                            "points": points, "osmTimestamp": stamp, "sha256": indicator_digest(raw)}
+            cities[city] = {"success": True, "city": city, "url": None, "query": None,
+                            "queryTemplate": indicator_access_query(city), "queryVerified": False,
+                            "points": points, "osmTimestamp": stamp, "sha256": indicator_digest(raw), **indicator_osm_export_info(raw)}
         pois = indicator_osm_document(cities)
     if poi_json is not None:
         try:
@@ -645,7 +708,9 @@ def indicator_fetch_city(city):
             raw = indicator_request(endpoint, timeout=30, data=indicator_urlparse.urlencode({"data": query}).encode("utf-8"))
             points, stamp = indicator_parse_osm(raw, city)
             return {"success": True, "city": city, "url": endpoint, "query": query, "sha256": indicator_digest(raw),
-                    "points": points, "osmTimestamp": stamp, "raw": raw, "failures": failures}
+                    "points": points, "osmTimestamp": stamp, "raw": raw, "failures": failures,
+                    "queryVerified": True,
+                    **indicator_osm_export_info(raw)}
         except Exception as error:
             failures.append({"url": endpoint, "error": type(error).__name__ + ": " + str(error)})
     return {"success": False, "city": city, "query": query, "failures": failures}
