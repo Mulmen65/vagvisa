@@ -1,4 +1,4 @@
-"""Vägvis 2.3.0: tre filer i GitHub, färdiga indata, inga arbetsflöden.
+"""Vägvis 2.3.1: tre filer i GitHub, färdiga indata, inga arbetsflöden.
 
 Start lokalt: python -m streamlit run streamlit_app.py
 Filerna requirements.txt och vagvis_data.json ska ligga bredvid denna fil.
