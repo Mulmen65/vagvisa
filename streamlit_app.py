@@ -1,4 +1,4 @@
-"""Vägvis 2.3.1: tre filer i GitHub, färdiga indata, inga arbetsflöden.
+"""Vägvis 2.4.0: tre filer i GitHub, färdiga indata, inga arbetsflöden.
 
 Start lokalt: python -m streamlit run streamlit_app.py
 Filerna requirements.txt och vagvis_data.json ska ligga bredvid denna fil.
@@ -166,7 +166,7 @@ def main() -> None:
     import streamlit as st
     import streamlit.components.v1 as components
 
-    st.set_page_config(page_title="Vägvis 2.3.0", page_icon="🚦", layout="wide", initial_sidebar_state="collapsed")
+    st.set_page_config(page_title="Vägvis 2.4.0", page_icon="🚦", layout="wide", initial_sidebar_state="collapsed")
     st.markdown("""<style>
 [data-testid="stHeader"], [data-testid="stSidebar"], footer {display:none;}
 .block-container {padding:0 !important;max-width:100% !important;}
